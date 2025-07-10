@@ -1,0 +1,60 @@
+FROM php:8.3-cli-bookworm
+
+# Installation der MySQL-Erweiterung
+RUN docker-php-ext-install -j$(nproc) mysqli \
+  && docker-php-ext-enable mysqli
+
+# Aktualisierung der Paketliste und Installation benötigter Bibliotheken in einem einzigen Schritt
+RUN apt-get update -y && apt-get upgrade -y && apt-get install -y \
+  libxml2-dev \
+  libpng-dev \
+  libxslt-dev \
+  libct4 \
+  libzip-dev \
+  libsybdb5 \
+  tdsodbc \
+  libfreetype6-dev \
+  libjpeg62-turbo-dev \
+  libmcrypt-dev \
+  libldap2-dev \
+  zlib1g-dev \
+  libc-client-dev \
+  libpq-dev \
+  libcurl4-openssl-dev \
+  libmagickwand-dev \
+  net-tools \
+	cron \ 
+  imagemagick \
+  gpg && \
+  apt-get clean -y
+
+# Installation und Aktivierung von PHP-Erweiterungen
+RUN docker-php-ext-install -j$(nproc) gd \
+  && docker-php-ext-install -j$(nproc) xsl \
+  && docker-php-ext-install -j$(nproc) soap \
+  && docker-php-ext-install -j$(nproc) pdo_pgsql \
+  && docker-php-ext-install -j$(nproc) intl \
+  && docker-php-ext-install -j$(nproc) pgsql \
+  && docker-php-ext-install -j$(nproc) ldap \
+  && docker-php-ext-install -j$(nproc) opcache \
+  && docker-php-ext-install -j$(nproc) zip
+
+# Installation und Aktivierung von Redis
+RUN pecl install redis \
+  && docker-php-ext-enable redis
+
+# Kopieren der PHP-Konfiguration
+COPY ./Docker/php.ini /usr/local/etc/php/php.ini
+
+#imagick
+COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
+RUN install-php-extensions imagick/imagick@master && docker-php-ext-enable imagick
+
+# Optional: Kopieren des Quellcodes in das Apache-Webverzeichnis
+COPY --chown=www-data:www-data /src /var/www/html/
+
+COPY ./Docker/crontab /etc/cron.d/crontab
+RUN chmod 0644 /etc/cron.d/crontab
+RUN crontab /etc/cron.d/crontab
+
+CMD touch /var/log/cron.log && printenv > /etc/environment && cron && tail -f /var/log/cron.log
