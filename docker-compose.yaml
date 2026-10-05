@@ -1,64 +1,93 @@
 # ==============================================================================
 # Moodle Development Stack - Docker Compose Configuration
 # ==============================================================================
-# 
+#
 # Dieser Docker Compose Stack stellt eine vollständige Moodle-Entwicklungsumgebung bereit
 # mit allen erforderlichen Services für die lokale Entwicklung.
 #
 # Services:
-# - moodle: Haupt-Webserver mit PHP 8.3 und Apache
-# - postgres: PostgreSQL 13 Datenbank
-# - moodle-cron: Cron-Service für automatische Moodle-Tasks
+# - moodle: Haupt-Webserver mit PHP 8.3, Apache und Moodle aus dem Git-Repository
+# - moodle-cron: Cron-Service für automatische Moodle-Tasks (gleiches Image)
+# - postgres: PostgreSQL 17 Datenbank
 # - pgadmin: Web-Interface für Datenbankmanagement
+#
+# Moodle-Version wählen (Branch, Tag oder Commit):
+#   MOODLE_REF=MOODLE_405_STABLE docker compose build
 #
 # ==============================================================================
 
----
+# Gemeinsame Einstellungen für Web- und Cron-Container
+x-moodle: &moodle
+  # Multi-Stage-Build: base (PHP ohne Build-Artefakte) -> moodle (Code aus Git)
+  build:
+    context: .
+    target: moodle
+    args:
+      MOODLE_REF: ${MOODLE_REF:-MOODLE_503_STABLE}
+  image: moodle-dev:${MOODLE_REF:-MOODLE_503_STABLE}
+
+  # Container automatisch neu starten bei Fehlern oder System-Neustart
+  restart: always
+
+  # Wird von Docker/config.php ausgewertet
+  environment:
+    MOODLE_WWWROOT: ${MOODLE_WWWROOT:-http://localhost}
+    MOODLE_DB_TYPE: pgsql
+    MOODLE_DB_HOST: postgres
+    MOODLE_DB_NAME: moodle
+    MOODLE_DB_USER: postgres
+    MOODLE_DB_PASSWORD: mypwd
+    MOODLE_DEBUG: "1"
+
+  volumes:
+    # Moodle-Datenverzeichnis (Uploads, Cache, etc.)
+    - ./moodledata:/var/www/moodledata
+    # Der Moodle-Code liegt im Image. Für die Plugin-Entwicklung einzelne
+    # Plugin-Verzeichnisse einhängen, z.B. (ab Moodle 5.1 unter public/):
+    # - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
+
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
-  
+
   # =============================================================================
   # MOODLE WEB-SERVICE
   # =============================================================================
-  # Haupt-Moodle-Container mit Apache-Webserver und PHP 8.3
   moodle:
-    # Verwendet das lokale Dockerfile für den Build
-    build: .
-    
+    <<: *moodle
+
     # Port-Mapping: Host:Container
     # Moodle ist über http://<ip> erreichbar
     ports:
       - 80:80
-    
-    # Container automatisch neu starten bei Fehlern oder System-Neustart
-    restart: always
-    
-    # Volume-Mounts für Datenpersistierung und Entwicklung
-    volumes:
-      # Moodle-Datenverzeichnis (Uploads, Cache, etc.)
-      - ./moodledata:/var/www/moodledata
-      # Source-Code-Verzeichnis (Live-Synchronisation für Entwicklung)
-      - ./src:/var/www/html/
-    
-    # Abhängigkeiten - startet erst nach der Datenbank
-    depends_on:
-      - postgres
+
+  # =============================================================================
+  # MOODLE CRON-SERVICE
+  # =============================================================================
+  # Nutzt dasselbe Image wie der Web-Container und führt den Moodle-Cron
+  # jede Minute als www-data aus (keine root-eigenen Dateien in moodledata).
+  moodle-cron:
+    <<: *moodle
+    user: www-data
+    command: ["sh", "-c", "while true; do php /var/www/html/admin/cli/cron.php; sleep 60; done"]
 
   # =============================================================================
   # POSTGRESQL DATENBANK
   # =============================================================================
-  # PostgreSQL 13 als primäre Datenbank für Moodle
+  # PostgreSQL 17 als primäre Datenbank für Moodle (Mindestversion für Moodle 5.3)
   postgres:
-    # Offizielles PostgreSQL 13 Image
-    image: "postgres:13"
-    
+    image: "postgres:17"
+
     # Port-Mapping für direkten Datenbankzugriff
     # Erreichbar über localhost:5432
     ports:
       - "5432:5432"
-    
+
     # Container automatisch neu starten
     restart: always
-    
+
     # Umgebungsvariablen für Datenbank-Konfiguration
     environment:
       # Passwort für den postgres-Superuser
@@ -67,12 +96,12 @@ services:
       POSTGRES_DB: moodle
       # Automatisch erstellter Benutzer (gleich wie DB-Name)
       POSTGRES_USER: postgres
-    
+
     # Persistent Volume für Datenbankdaten
     volumes:
       # Lokales Verzeichnis für Datenpersistierung
       - ./pgdata:/var/lib/postgresql/data
-    
+
     # Gesundheitsprüfung für bessere Abhängigkeitsverwaltung
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -81,45 +110,16 @@ services:
       retries: 5
 
   # =============================================================================
-  # MOODLE CRON-SERVICE
-  # =============================================================================
-  # Separater Container für Moodle Cron-Jobs (läuft alle Minute)
-  moodle-cron:
-    # Verwendet spezielles Cron-Dockerfile
-    build:
-      context: .
-      dockerfile: Dockerfile-cron
-    
-    # TTY und interaktive Modi für besseres Logging
-    stdin_open: true
-    tty: true
-    
-    # Container automatisch neu starten
-    restart: always
-    
-    # Gleiche Volumes wie Moodle-Container für Zugriff auf Daten und Code
-    volumes:
-      # Moodle-Datenverzeichnis
-      - ./moodledata:/var/www/moodledata
-      # Source-Code-Verzeichnis
-      - ./src:/var/www/html
-    
-    # Abhängigkeiten - wartet auf Datenbank und Moodle
-    depends_on:
-      - postgres
-      - moodle
-
-  # =============================================================================
   # PGADMIN WEB-INTERFACE
   # =============================================================================
   # Web-basierte Datenbankverwaltung für PostgreSQL
   pgadmin:
     # Offizielles pgAdmin 4 Image
     image: dpage/pgadmin4
-    
+
     # Container automatisch neu starten
     restart: always
-    
+
     # Umgebungsvariablen für pgAdmin-Konfiguration
     environment:
       # Standard-Login-Email für pgAdmin
@@ -137,9 +137,7 @@ services:
     # pgAdmin erreichbar über http://<ip>:8080
     ports:
       - "8080:80"
-    
+
     # Abhängigkeiten - startet nach der Datenbank
     depends_on:
       - postgres
-
-

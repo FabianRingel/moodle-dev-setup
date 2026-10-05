@@ -1,0 +1,6 @@
+# Laufzeitdaten der Compose-Services gehören nicht in den Build-Kontext
+moodledata
+pgdata
+pgadmin
+src
+.git
