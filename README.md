@@ -21,8 +21,8 @@ Ein vollständiger Docker-basierter Entwicklungsstack für Moodle mit PostgreSQL
 
 Dieser Development Stack bietet eine vollständige Moodle-Entwicklungsumgebung mit:
 
-- **Moodle**: PHP 8.3 mit Apache-Webserver
-- **PostgreSQL 13**: Relationale Datenbank
+- **Moodle**: PHP 8.3 mit Apache-Webserver, Moodle-Code direkt aus Git (Multi-Stage-Build)
+- **PostgreSQL 17**: Relationale Datenbank
 - **pgAdmin 4**: Web-basierte Datenbankverwaltung
 - **Cron Service**: Automatische Ausführung von Moodle-Tasks
 - **Persistent Volumes**: Datenpersistierung zwischen Container-Neustarts
@@ -103,9 +103,40 @@ Dieser Development Stack bietet eine vollständige Moodle-Entwicklungsumgebung m
 
 ## 🏗️ Stack-Komponenten
 
+### Image-Aufbau (Multi-Stage-Build)
+
+Das `Dockerfile` baut das Moodle-Image in mehreren Stages:
+
+| Stage | Inhalt |
+|-------|--------|
+| `builder` | Kompiliert alle PHP-Erweiterungen (mit `-dev`-Paketen und Compiler) und ermittelt per `ldd` die benötigten Laufzeit-Bibliotheken |
+| `base` | Offizielles `php:8.3-apache-bookworm` + fertige Erweiterungen + nur deren Laufzeit-Bibliotheken – **keine Build-Artefakte** |
+| `moodle-source` | Shallow-Fetch des [Moodle-Git-Repositorys](https://github.com/moodle/moodle) in der gewünschten Revision (ohne `.git`) |
+| `moodle` | `base` + Moodle-Quellcode + `Docker/config.php` |
+
+```bash
+# Nur das Base-Image bauen
+docker build --target base -t moodle-base .
+
+# Moodle-Image mit bestimmter Version (Branch, Tag oder Commit)
+docker build --target moodle --build-arg MOODLE_REF=MOODLE_503_STABLE -t moodle-dev .
+```
+
+Build-Argumente:
+
+| Argument | Standard | Beschreibung |
+|----------|----------|--------------|
+| `PHP_VERSION` | `8.3` | PHP-Version des Basis-Images |
+| `DEBIAN_RELEASE` | `bookworm` | Debian-Release des Basis-Images |
+| `MOODLE_REPO` | `https://github.com/moodle/moodle.git` | Git-Repository (z.B. eigener Fork) |
+| `MOODLE_REF` | `MOODLE_503_STABLE` | Branch, Tag oder Commit |
+
+Ab Moodle 5.1 liegt der Webroot unter `public/`. Das Image erkennt das beim Build
+und setzt den Apache-`DocumentRoot` sowie den Moodle-Router (`FallbackResource /r.php`) passend.
+
 ### 1. Moodle Container (`moodle`)
-- **Base Image**: PHP 8.3 Apache (Debian Bookworm)
-- **PHP Extensions**: 
+- **Image**: Stage `moodle` aus dem `Dockerfile`
+- **PHP Extensions**:
   - mysqli, pdo_pgsql, pgsql (Datenbank)
   - gd, imagick (Bildverarbeitung)
   - intl (Internationalisierung)
@@ -116,15 +147,17 @@ Dieser Development Stack bietet eine vollständige Moodle-Entwicklungsumgebung m
   - zip, soap, xsl, exif (Verschiedene Funktionen)
 
 ### 2. PostgreSQL Container (`postgres`)
-- **Version**: PostgreSQL 13
+- **Version**: PostgreSQL 17 (Mindestversion für Moodle 5.3)
 - **Standard-Datenbank**: `moodle`
 - **Benutzer**: `postgres`
 - **Passwort**: `mypwd`
 
+> ⚠️ Ein bestehendes `pgdata/` aus PostgreSQL 13 startet nicht mit PostgreSQL 17.
+> Entweder vorher per `pg_dump` sichern und neu einspielen oder `pgdata/` löschen.
+
 ### 3. Cron Container (`moodle-cron`)
-- **Base Image**: PHP 8.3 CLI
-- **Funktion**: Führt Moodle Cron-Jobs alle Minute aus
-- **Gleiche PHP-Extensions** wie der Moodle-Container
+- **Image**: dasselbe wie `moodle`
+- **Funktion**: Führt `admin/cli/cron.php` jede Minute als `www-data` aus
 
 ### 4. pgAdmin Container (`pgadmin`)
 - **Version**: pgAdmin 4 (neueste)
@@ -133,107 +166,70 @@ Dieser Development Stack bietet eine vollständige Moodle-Entwicklungsumgebung m
 
 ## 🚀 Installation
 
-### 1. Repository klonen/erstellen
+### 1. Repository klonen
 
 ```bash
-# Projekt-Verzeichnis erstellen
-mkdir moodle-dev-setup
+git clone <repository-url> moodle-dev-setup
 cd moodle-dev-setup
-
-# Falls Sie das Projekt klonen:
-git clone <repository-url> .
 ```
 
-### 2. Moodle herunterladen
+### 2. Image bauen
+
+Moodle muss nicht mehr manuell heruntergeladen werden – der Code wird beim Build aus Git geholt.
 
 ```bash
-# Moodle direkt in das src-Verzeichnis herunterladen
-cd src
+# Standard-Version (MOODLE_503_STABLE)
+docker compose build
 
-# Option 1: Git Clone (empfohlen für Entwicklung)
-git clone https://github.com/moodle/moodle.git .
-cd moodle
-git checkout MOODLE_403_STABLE  # oder gewünschte Version
-
-# Option 2: Download als ZIP
-wget https://download.moodle.org/download.php/direct/stable403/moodle-latest-403.zip
-unzip moodle-latest-403.zip
-mv moodle/* .
-rm -rf moodle moodle-latest-403.zip
-
-cd ..
+# Andere Version
+MOODLE_REF=MOODLE_405_STABLE docker compose build
 ```
 
 ### 3. Container starten
 
 ```bash
 # Container im Hintergrund starten
-docker-compose up -d
+docker compose up -d
 
 # Container-Status überprüfen
-docker-compose ps
+docker compose ps
 
 # Logs anzeigen
-docker-compose logs -f
+docker compose logs -f
 ```
 
 ## ⚙️ Konfiguration
 
 ### 1. Moodle-Installation
 
-1. **Browser öffnen**: `http://localhost`
-2. **Installationsassistent** folgen
-3. **Datenbankeinstellungen**:
-   - Datenbanktyp: PostgreSQL
-   - Host: `postgres`
-   - Datenbank: `moodle`
-   - Benutzer: `postgres`
-   - Passwort: `mypwd`
-   - Port: `5432`
+Die `config.php` ist bereits im Image enthalten. Die Datenbank wird entweder im Browser
+(`http://localhost`) oder per CLI installiert:
+
+```bash
+docker compose exec -u www-data moodle php admin/cli/install_database.php \
+  --agree-license --adminuser=admin --adminpass='Admin1234!' \
+  --adminemail=admin@example.com --fullname="Moodle Dev" --shortname=dev
+```
 
 ### 2. Moodle-Konfiguration (`config.php`)
 
-Nach der Installation erstellen Sie eine `src/config.php`:
+`Docker/config.php` wird ins Image kopiert und liest alle Werte aus Umgebungsvariablen,
+die in `docker-compose.yaml` gesetzt sind:
 
-```php
-<?php
-unset($CFG);
-global $CFG;
-$CFG = new stdClass();
+| Variable | Standard | Beschreibung |
+|----------|----------|--------------|
+| `MOODLE_WWWROOT` | `http://localhost` | Öffentliche URL |
+| `MOODLE_DB_TYPE` | `pgsql` | Datenbanktyp |
+| `MOODLE_DB_HOST` | `postgres` | Datenbank-Host |
+| `MOODLE_DB_PORT` | `5432` | Datenbank-Port |
+| `MOODLE_DB_NAME` | `moodle` | Datenbankname |
+| `MOODLE_DB_USER` | `postgres` | Datenbank-Benutzer |
+| `MOODLE_DB_PASSWORD` | – | Datenbank-Passwort |
+| `MOODLE_DB_PREFIX` | `mdl_` | Tabellen-Präfix |
+| `MOODLE_DATAROOT` | `/var/www/moodledata` | Moodledata-Verzeichnis |
+| `MOODLE_DEBUG` | `1` | Developer-Debugging an (`1`) / aus (`0`) |
 
-$CFG->dbtype    = 'pgsql';
-$CFG->dblibrary = 'native';
-$CFG->dbhost    = 'postgres';
-$CFG->dbname    = 'moodle';
-$CFG->dbuser    = 'postgres';
-$CFG->dbpass    = 'mypwd';
-$CFG->prefix    = 'mdl_';
-$CFG->dboptions = array(
-    'dbpersist' => 0,
-    'dbport' => 5432,
-    'dbsocket' => '',
-    'dbcollation' => 'utf8_unicode_ci',
-);
-
-$CFG->wwwroot   = 'http://localhost';
-$CFG->dataroot  = '/var/www/moodledata';
-$CFG->admin     = 'admin';
-
-$CFG->directorypermissions = 0777;
-
-// Performance-Optimierungen
-$CFG->session_handler_class = '\core\session\redis';
-$CFG->session_redis_host = 'redis';
-$CFG->session_redis_port = 6379;
-
-// Debugging (nur für Entwicklung)
-$CFG->debug = (E_ALL | E_STRICT);
-$CFG->debugdisplay = 1;
-$CFG->debugsmtp = 1;
-
-require_once(__DIR__ . '/lib/setup.php');
-?>
-```
+Weitere Einstellungen direkt in `Docker/config.php` ergänzen und das Image neu bauen.
 
 ### 3. PHP-Konfiguration anpassen
 
@@ -282,8 +278,8 @@ docker-compose exec postgres psql -U postgres -d moodle
 ### Entwicklungsworkflow
 
 ```bash
-# Code-Änderungen werden automatisch synchronisiert
-# (Volume-Mount: ./src:/var/www/html/)
+# Der Moodle-Code liegt im Image; Plugins werden per Volume eingehängt
+# (siehe Plugin-Entwicklung)
 
 # Cache leeren (bei PHP-Änderungen)
 docker-compose exec moodle php /var/www/html/admin/cli/purge_caches.php
@@ -325,7 +321,7 @@ docker-compose exec moodle php /var/www/html/admin/cli/reset_password.php --user
             "request": "launch",
             "port": 9003,
             "pathMappings": {
-                "/var/www/html": "${workspaceFolder}/src"
+                "/var/www/html/public/local/myplugin": "${workspaceFolder}/plugins/local_myplugin"
             }
         }
     ]
@@ -345,12 +341,21 @@ xdebug.client_port = 9003
 
 ### Plugin-Entwicklung
 
+Der Moodle-Core kommt aus dem Image. Eigene Plugins werden als Volume eingehängt,
+z.B. in `docker-compose.yaml` unter `x-moodle.volumes` (ab Moodle 5.1 unter `public/`):
+
+```yaml
+volumes:
+  - ./moodledata:/var/www/moodledata
+  - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
+```
+
 ```bash
 # Plugin-Verzeichnis
-mkdir -p src/local/myplugin
+mkdir -p plugins/local_myplugin
 
 # Plugin-Installation testen
-docker-compose exec moodle php /var/www/html/admin/cli/upgrade.php
+docker-compose exec -u www-data moodle php /var/www/html/admin/cli/upgrade.php
 ```
 
 ### Coding Standards
@@ -479,7 +484,7 @@ docker-compose exec moodle tail -f /var/log/apache2/access.log
 docker-compose exec moodle tail -f /var/log/php_errors.log
 
 # Cron-Logs
-docker-compose exec moodle-cron tail -f /var/log/cron.log
+docker-compose logs -f moodle-cron
 
 # PostgreSQL-Logs
 docker-compose logs postgres
@@ -505,10 +510,6 @@ docker-compose exec -T postgres pg_dump -U postgres moodle > $BACKUP_DIR/databas
 # Moodledata-Backup
 echo "Erstelle Moodledata-Backup..."
 tar -czf $BACKUP_DIR/moodledata.tar.gz moodledata/
-
-# Source-Code-Backup (falls lokal modifiziert)
-echo "Erstelle Source-Backup..."
-tar -czf $BACKUP_DIR/src.tar.gz src/
 
 echo "Backup erstellt in: $BACKUP_DIR"
 ```
@@ -558,7 +559,7 @@ version: '3.8'
 services:
   moodle:
     volumes:
-      - ./src:/var/www/html:cached  # macOS-Optimierung
+      - ./moodledata:/var/www/moodledata:cached  # macOS-Optimierung
     environment:
       - PHP_OPCACHE_ENABLE=1
       - PHP_OPCACHE_MEMORY_CONSUMPTION=256
@@ -608,7 +609,6 @@ docker stats
 # Disk-Usage prüfen
 du -sh moodledata/
 du -sh pgdata/
-du -sh src/
 
 # Datenbank-Größe prüfen
 docker-compose exec postgres psql -U postgres -d moodle -c "
