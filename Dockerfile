@@ -5,14 +5,17 @@
 # Stages:
 #   builder        Kompiliert alle PHP-Erweiterungen (inkl. -dev-Pakete, Compiler, …)
 #                  und ermittelt die zur Laufzeit benötigten Shared Libraries.
-#   base           Schlankes PHP/Apache-Image: nur die fertigen Erweiterungen und
+#   base           Schlankes PHP-FPM-Image: nur die fertigen Erweiterungen und
 #                  deren Laufzeit-Bibliotheken – keine Build-Artefakte.
 #   moodle-source  Holt den Moodle-Quellcode aus dem Git-Repository (ohne .git).
-#   moodle         base + Moodle-Quellcode.
+#   moodle         base + Moodle-Quellcode (PHP-FPM auf Port 9000).
+#   web            nginx mit den statischen Moodle-Dateien; leitet PHP an
+#                  den moodle-Container weiter.
 #
 # Beispiele:
 #   docker build --target base   -t moodle-base .
 #   docker build --target moodle -t moodle-dev  --build-arg MOODLE_REF=MOODLE_503_STABLE .
+#   docker build --target web    -t moodle-web  --build-arg MOODLE_REF=MOODLE_503_STABLE .
 #
 # ==============================================================================
 
@@ -22,7 +25,7 @@ ARG DEBIAN_RELEASE=bookworm
 # ------------------------------------------------------------------------------
 # Stage 1: builder
 # ------------------------------------------------------------------------------
-FROM php:${PHP_VERSION}-apache-${DEBIAN_RELEASE} AS builder
+FROM php:${PHP_VERSION}-fpm-${DEBIAN_RELEASE} AS builder
 
 COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
 
@@ -57,9 +60,9 @@ RUN set -eux; \
     cat /runtime-packages.txt
 
 # ------------------------------------------------------------------------------
-# Stage 2: base – PHP + Apache ohne Build-Artefakte
+# Stage 2: base – PHP-FPM ohne Build-Artefakte
 # ------------------------------------------------------------------------------
-FROM php:${PHP_VERSION}-apache-${DEBIAN_RELEASE} AS base
+FROM php:${PHP_VERSION}-fpm-${DEBIAN_RELEASE} AS base
 
 COPY --from=builder /runtime-packages.txt /tmp/runtime-packages.txt
 
@@ -74,9 +77,9 @@ COPY --from=builder /usr/local/lib/php/extensions/ /usr/local/lib/php/extensions
 COPY --from=builder /usr/local/etc/php/conf.d/     /usr/local/etc/php/conf.d/
 
 COPY ./Docker/php.ini /usr/local/etc/php/php.ini
+COPY ./Docker/php-fpm.conf /usr/local/etc/php-fpm.d/zz-moodle.conf
 
 RUN set -eux; \
-    a2enmod headers rewrite actions; \
     mkdir -p /var/www/moodledata; \
     chown www-data:www-data /var/www/moodledata; \
     # Sicherstellen, dass alle Erweiterungen ohne fehlende Libraries laden
@@ -100,7 +103,11 @@ RUN set -eux; \
     git init -q /moodle; \
     git -C /moodle fetch -q --depth 1 "$MOODLE_REPO" "$MOODLE_REF"; \
     git -C /moodle checkout -q FETCH_HEAD; \
-    rm -rf /moodle/.git
+    rm -rf /moodle/.git; \
+    # Für nginx nur die öffentlich erreichbaren Dateien bereitstellen
+    # (ab Moodle 5.1 public/, davor der gesamte Code)
+    mkdir -p /webroot; \
+    if [ -d /moodle/public ]; then cp -a /moodle/public /webroot/public; else cp -a /moodle/. /webroot/; fi
 
 # ------------------------------------------------------------------------------
 # Stage 4: moodle – base + Moodle-Code
@@ -112,15 +119,23 @@ COPY --from=moodle-source --chown=www-data:www-data /moodle /var/www/html
 # config.php liest die Einstellungen aus Umgebungsvariablen (siehe docker-compose.yaml)
 COPY --chown=www-data:www-data ./Docker/config.php /var/www/html/config.php
 
+# ------------------------------------------------------------------------------
+# Stage 5: web – nginx vor PHP-FPM
+# ------------------------------------------------------------------------------
+FROM nginx:stable AS web
+
+# Adresse des PHP-FPM-Containers (wird beim Start per envsubst eingesetzt)
+ENV PHP_FPM_HOST=moodle:9000
+
+COPY --from=moodle-source /webroot /var/www/html
+COPY ./Docker/nginx.conf.template /tmp/moodle.conf.template
+
 # Ab Moodle 5.1 liegt der Webroot im Unterordner public/ und Moodle nutzt
-# einen Router (r.php). Apache wird passend zur ausgecheckten Version konfiguriert.
+# einen Router (r.php). nginx wird passend zur ausgecheckten Version konfiguriert.
 RUN set -eux; \
     if [ -d /var/www/html/public ]; then docroot=/var/www/html/public; else docroot=/var/www/html; fi; \
-    sed -ri "s!/var/www/html!${docroot}!g" /etc/apache2/sites-available/*.conf; \
-    { \
-      echo "<Directory ${docroot}>"; \
-      echo "    AllowOverride All"; \
-      if [ -f "${docroot}/r.php" ]; then echo "    FallbackResource /r.php"; fi; \
-      echo "</Directory>"; \
-    } > /etc/apache2/conf-available/moodle.conf; \
-    a2enconf moodle
+    if [ -f "${docroot}/r.php" ]; then fallback=/r.php; else fallback==404; fi; \
+    mkdir -p /etc/nginx/templates; \
+    sed -e "s!@DOCROOT@!${docroot}!g" -e "s!@FALLBACK@!${fallback}!g" \
+      /tmp/moodle.conf.template > /etc/nginx/templates/default.conf.template; \
+    rm /tmp/moodle.conf.template /etc/nginx/conf.d/default.conf

@@ -31,7 +31,7 @@ $CFG->admin    = 'admin';
 
 $CFG->directorypermissions = 02777;
 
-// Apache leitet unbekannte Pfade an r.php weiter (siehe Dockerfile).
+// nginx leitet unbekannte Pfade an r.php weiter (siehe Docker/nginx.conf.template).
 $CFG->routerconfigured = true;
 
 // Entwicklungseinstellungen

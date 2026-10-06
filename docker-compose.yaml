@@ -6,7 +6,8 @@
 # mit allen erforderlichen Services für die lokale Entwicklung.
 #
 # Services:
-# - moodle: Haupt-Webserver mit PHP 8.3, Apache und Moodle aus dem Git-Repository
+# - web: nginx-Webserver, leitet PHP-Requests an den moodle-Container weiter
+# - moodle: PHP 8.3 (FPM) mit Moodle aus dem Git-Repository
 # - moodle-cron: Cron-Service für automatische Moodle-Tasks (gleiches Image)
 # - postgres: PostgreSQL 17 Datenbank
 # - pgadmin: Web-Interface für Datenbankmanagement
@@ -16,9 +17,9 @@
 #
 # ==============================================================================
 
-# Gemeinsame Einstellungen für Web- und Cron-Container
+# Gemeinsame Einstellungen für PHP-FPM- und Cron-Container
 x-moodle: &moodle
-  # Multi-Stage-Build: base (PHP ohne Build-Artefakte) -> moodle (Code aus Git)
+  # Multi-Stage-Build: base (PHP-FPM ohne Build-Artefakte) -> moodle (Code aus Git)
   build:
     context: .
     target: moodle
@@ -43,7 +44,8 @@ x-moodle: &moodle
     # Moodle-Datenverzeichnis (Uploads, Cache, etc.)
     - ./moodledata:/var/www/moodledata
     # Der Moodle-Code liegt im Image. Für die Plugin-Entwicklung einzelne
-    # Plugin-Verzeichnisse einhängen, z.B. (ab Moodle 5.1 unter public/):
+    # Plugin-Verzeichnisse einhängen, z.B. (ab Moodle 5.1 unter public/).
+    # Denselben Mount auch beim web-Service eintragen (statische Dateien).
     # - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
 
   depends_on:
@@ -53,20 +55,43 @@ x-moodle: &moodle
 services:
 
   # =============================================================================
-  # MOODLE WEB-SERVICE
+  # NGINX WEB-SERVICE
   # =============================================================================
-  moodle:
-    <<: *moodle
+  # Liefert statische Dateien aus und reicht PHP an moodle:9000 (PHP-FPM) weiter
+  web:
+    build:
+      context: .
+      target: web
+      args:
+        MOODLE_REF: ${MOODLE_REF:-MOODLE_503_STABLE}
+    image: moodle-web:${MOODLE_REF:-MOODLE_503_STABLE}
 
     # Port-Mapping: Host:Container
     # Moodle ist über http://<ip> erreichbar
     ports:
       - 80:80
 
+    restart: always
+
+    environment:
+      PHP_FPM_HOST: moodle:9000
+
+    # volumes:
+    #   - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
+
+    depends_on:
+      - moodle
+
+  # =============================================================================
+  # MOODLE PHP-FPM-SERVICE
+  # =============================================================================
+  moodle:
+    <<: *moodle
+
   # =============================================================================
   # MOODLE CRON-SERVICE
   # =============================================================================
-  # Nutzt dasselbe Image wie der Web-Container und führt den Moodle-Cron
+  # Nutzt dasselbe Image wie der moodle-Container und führt den Moodle-Cron
   # jede Minute als www-data aus (keine root-eigenen Dateien in moodledata).
   moodle-cron:
     <<: *moodle

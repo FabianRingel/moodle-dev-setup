@@ -1,0 +1,50 @@
+# nginx-Konfiguration für Moodle
+#
+# @DOCROOT@ und @FALLBACK@ werden beim Image-Build passend zur Moodle-Version
+# gesetzt, ${PHP_FPM_HOST} beim Container-Start (nginx envsubst-Templates).
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    root @DOCROOT@;
+    index index.php index.html;
+
+    # Entspricht post_max_size / upload_max_filesize in Docker/php.ini
+    client_max_body_size 1G;
+
+    # Versteckte Dateien (.git, .htaccess, …) nie ausliefern
+    location ~ /\. {
+        return 404;
+    }
+
+    # Interne Dateien, die laut Moodle-Doku nicht öffentlich erreichbar sein dürfen
+    location ~ (/vendor/|/node_modules/|composer\.(json|lock)|/readme|/README|readme\.txt|/upgrade\.txt|/UPGRADING\.md|db/install\.xml|/fixtures/|/behat/|phpunit\.xml|\.lock|environment\.xml) {
+        return 404;
+    }
+
+    # Unbekannte Pfade gehen an den Moodle-Router (ab Moodle 4.5)
+    location / {
+        try_files $uri $uri/ @FALLBACK@;
+    }
+
+    # PHP an PHP-FPM; PATH_INFO wird für Slash-Arguments
+    # (z.B. pluginfile.php/1/…) benötigt
+    location ~ [^/]\.php(/|$) {
+        fastcgi_split_path_info ^(.+\.php)(/.*)$;
+        if (!-f $document_root$fastcgi_script_name) {
+            return 404;
+        }
+
+        fastcgi_pass ${PHP_FPM_HOST};
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+
+        fastcgi_read_timeout 300s;
+        fastcgi_buffers 16 32k;
+        fastcgi_buffer_size 64k;
+    }
+}
