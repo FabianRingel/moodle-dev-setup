@@ -1,6 +1,15 @@
+# Geheimnisse nie ins Image
+.env
+
 # Laufzeitdaten der Compose-Services gehören nicht in den Build-Kontext
 moodledata
 pgdata
 pgadmin
 src
 .git
+
+# Eigene Plugins/Erweiterungen werden eingehängt, nicht ins Image gebaut
+plugins
+tools
+extensions
+config.d

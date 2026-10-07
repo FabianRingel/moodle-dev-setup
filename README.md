@@ -21,7 +21,7 @@ Ein vollständiger Docker-basierter Entwicklungsstack für Moodle mit PostgreSQL
 
 Dieser Development Stack bietet eine vollständige Moodle-Entwicklungsumgebung mit:
 
-- **Moodle**: PHP 8.3 mit Apache-Webserver, Moodle-Code direkt aus Git (Multi-Stage-Build)
+- **Moodle**: PHP 8.3 (PHP-FPM) hinter nginx, Moodle-Code direkt aus Git (Multi-Stage-Build)
 - **PostgreSQL 17**: Relationale Datenbank
 - **pgAdmin 4**: Web-basierte Datenbankverwaltung
 - **Cron Service**: Automatische Ausführung von Moodle-Tasks
@@ -110,16 +110,19 @@ Das `Dockerfile` baut das Moodle-Image in mehreren Stages:
 | Stage | Inhalt |
 |-------|--------|
 | `builder` | Kompiliert alle PHP-Erweiterungen (mit `-dev`-Paketen und Compiler) und ermittelt per `ldd` die benötigten Laufzeit-Bibliotheken |
-| `base` | Offizielles `php:8.3-apache-bookworm` + fertige Erweiterungen + nur deren Laufzeit-Bibliotheken – **keine Build-Artefakte** |
+| `base` | Offizielles `php:8.3-fpm-bookworm` + fertige Erweiterungen + nur deren Laufzeit-Bibliotheken – **keine Build-Artefakte** |
 | `moodle-source` | Shallow-Fetch des [Moodle-Git-Repositorys](https://github.com/moodle/moodle) in der gewünschten Revision (ohne `.git`) |
-| `moodle` | `base` + Moodle-Quellcode + `Docker/config.php` |
+| `moodle-vendor` | `composer install --no-dev` für die Bibliotheken, die Moodle nicht mehr selbst mitbringt (`vendor/`) |
+| `moodle` | `base` + Moodle-Quellcode inkl. `vendor/` + `Docker/config.php` (PHP-FPM auf Port 9000) |
+| `nginx` | `nginx:stable` + derselbe Moodle-Code + `Docker/nginx.conf` |
 
 ```bash
 # Nur das Base-Image bauen
 docker build --target base -t moodle-base .
 
-# Moodle-Image mit bestimmter Version (Branch, Tag oder Commit)
+# Moodle- und nginx-Image mit bestimmter Version (Branch, Tag oder Commit)
 docker build --target moodle --build-arg MOODLE_REF=MOODLE_503_STABLE -t moodle-dev .
+docker build --target nginx  --build-arg MOODLE_REF=MOODLE_503_STABLE -t moodle-dev-nginx .
 ```
 
 Build-Argumente:
@@ -131,11 +134,23 @@ Build-Argumente:
 | `MOODLE_REPO` | `https://github.com/moodle/moodle.git` | Git-Repository (z.B. eigener Fork) |
 | `MOODLE_REF` | `MOODLE_503_STABLE` | Branch, Tag oder Commit |
 
-Ab Moodle 5.1 liegt der Webroot unter `public/`. Das Image erkennt das beim Build
-und setzt den Apache-`DocumentRoot` sowie den Moodle-Router (`FallbackResource /r.php`) passend.
+Ab Moodle 5.1 liegt der Webroot unter `public/`. Das nginx-Image erkennt das beim Build
+und setzt `root` sowie den Moodle-Router passend: Pfade ohne passende Datei – auch nicht
+existierende `*.php` (Shim-Routen) – gehen an `/r.php`.
 
-### 1. Moodle Container (`moodle`)
+### 1. nginx Container (`nginx`)
+- **Image**: Stage `nginx` aus dem `Dockerfile`
+- **Funktion**: Liefert statische Dateien direkt aus und reicht PHP-Anfragen per FastCGI an PHP-FPM (`127.0.0.1:9000`) weiter
+- **Konfiguration**: `Docker/nginx.conf` (u.a. `client_max_body_size 1G`, Slash-Argumente, Sperre interner Dateien)
+- **Netzwerk**: `network_mode: service:moodle` – nginx und `moodle-cron` teilen sich den
+  Netzwerk-Namespace des `moodle`-Containers (wie ein Pod). So erreicht Moodle seine eigene
+  `wwwroot` (`http://localhost`) auch serverseitig, z.B. für die Router-Prüfung unter
+  *Website-Administration → Berichte → Systemprüfungen*. Der Port 80 wird deshalb beim
+  `moodle`-Service veröffentlicht.
+
+### 2. Moodle Container (`moodle`)
 - **Image**: Stage `moodle` aus dem `Dockerfile`
+- **PHP-FPM**: Port 9000 (nur intern), Pool-Einstellungen in `Docker/php-fpm.conf`
 - **PHP Extensions**:
   - mysqli, pdo_pgsql, pgsql (Datenbank)
   - gd, imagick (Bildverarbeitung)
@@ -146,7 +161,7 @@ und setzt den Apache-`DocumentRoot` sowie den Moodle-Router (`FallbackResource /
   - xdebug (Debugging)
   - zip, soap, xsl, exif (Verschiedene Funktionen)
 
-### 2. PostgreSQL Container (`postgres`)
+### 3. PostgreSQL Container (`postgres`)
 - **Version**: PostgreSQL 17 (Mindestversion für Moodle 5.3)
 - **Standard-Datenbank**: `moodle`
 - **Benutzer**: `postgres`
@@ -155,11 +170,11 @@ und setzt den Apache-`DocumentRoot` sowie den Moodle-Router (`FallbackResource /
 > ⚠️ Ein bestehendes `pgdata/` aus PostgreSQL 13 startet nicht mit PostgreSQL 17.
 > Entweder vorher per `pg_dump` sichern und neu einspielen oder `pgdata/` löschen.
 
-### 3. Cron Container (`moodle-cron`)
+### 4. Cron Container (`moodle-cron`)
 - **Image**: dasselbe wie `moodle`
 - **Funktion**: Führt `admin/cli/cron.php` jede Minute als `www-data` aus
 
-### 4. pgAdmin Container (`pgadmin`)
+### 5. pgAdmin Container (`pgadmin`)
 - **Version**: pgAdmin 4 (neueste)
 - **Web-Interface** für Datenbankmanagement
 - **Standard-Login**: xxx@xxx.xxx / verysecure
@@ -301,7 +316,8 @@ docker-compose exec moodle php /var/www/html/admin/cli/reset_password.php --user
 
 ### Service-Details
 
-- **Moodle**: Port 80 → 80
+- **Moodle (nginx)**: Port 80 → 80 (veröffentlicht am `moodle`-Service, siehe oben)
+- **PHP-FPM (`moodle`)**: Port 9000, nur innerhalb des gemeinsamen Netzwerk-Namespace
 - **PostgreSQL**: Port 5432 → 5432
 - **pgAdmin**: Port 80 → 8080
 
@@ -342,12 +358,20 @@ xdebug.client_port = 9003
 ### Plugin-Entwicklung
 
 Der Moodle-Core kommt aus dem Image. Eigene Plugins werden als Volume eingehängt,
-z.B. in `docker-compose.yaml` unter `x-moodle.volumes` (ab Moodle 5.1 unter `public/`):
+z.B. in `docker-compose.yaml` unter `x-moodle.volumes` (ab Moodle 5.1 unter `public/`).
+Da nginx statische Dateien (Bilder, JS, …) selbst ausliefert, gehört dasselbe Volume
+auch zum `nginx`-Service:
 
 ```yaml
-volumes:
-  - ./moodledata:/var/www/moodledata
-  - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
+x-moodle: &moodle
+  volumes:
+    - ./moodledata:/var/www/moodledata
+    - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
+
+services:
+  nginx:
+    volumes:
+      - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
 ```
 
 ```bash
@@ -357,6 +381,38 @@ mkdir -p plugins/local_myplugin
 # Plugin-Installation testen
 docker-compose exec -u www-data moodle php /var/www/html/admin/cli/upgrade.php
 ```
+
+### Erweiterungen (eigene Plugins und Dienste)
+
+Eigene Plugins und Zusatzdienste müssen nicht in `docker-compose.yaml` stehen. Besser ist eine
+eigene Compose-Datei (z.B. in einem separaten, auch privaten Repository), die per `COMPOSE_FILE`
+in `.env` angehängt wird. Docker Compose führt die Dateien zusammen; relative Pfade gelten ab dem
+Projektordner.
+
+```bash
+# .env
+COMPOSE_FILE=docker-compose.yaml:extensions/docker-compose.myplugins.yaml
+```
+
+```yaml
+# extensions/docker-compose.myplugins.yaml
+services:
+  moodle:
+    volumes:
+      - ./plugins/local_myplugin:/var/www/html/public/local/myplugin:ro
+      - ./extensions/config.d:/var/www/config.d:ro
+  moodle-cron:
+    volumes:
+      - ./plugins/local_myplugin:/var/www/html/public/local/myplugin:ro
+  nginx:
+    volumes:
+      - ./plugins/local_myplugin:/var/www/html/public/local/myplugin:ro
+```
+
+`Docker/config.php` bindet alle `*.php` aus `/var/www/config.d` ein (z.B. für
+`$CFG->forced_plugin_settings`); dort stehen `$CFG` und die Hilfsfunktion `$env($name, $default)`
+für Umgebungsvariablen zur Verfügung. `plugins/` ist in `.gitignore` – Plugins mit eigenem
+Repository dort hinein klonen.
 
 ### Coding Standards
 
@@ -476,12 +532,11 @@ docker stats
 ### Log-Dateien
 
 ```bash
-# Apache-Logs
-docker-compose exec moodle tail -f /var/log/apache2/error.log
-docker-compose exec moodle tail -f /var/log/apache2/access.log
+# nginx-Logs (Access- und Error-Log)
+docker compose logs -f nginx
 
-# PHP-Logs
-docker-compose exec moodle tail -f /var/log/php_errors.log
+# PHP-/PHP-FPM-Logs (PHP-Fehler landen über catch_workers_output im Container-Log)
+docker compose logs -f moodle
 
 # Cron-Logs
 docker-compose logs -f moodle-cron

@@ -5,14 +5,18 @@
 # Stages:
 #   builder        Kompiliert alle PHP-Erweiterungen (inkl. -dev-Pakete, Compiler, …)
 #                  und ermittelt die zur Laufzeit benötigten Shared Libraries.
-#   base           Schlankes PHP/Apache-Image: nur die fertigen Erweiterungen und
+#   base           Schlankes PHP-FPM-Image: nur die fertigen Erweiterungen und
 #                  deren Laufzeit-Bibliotheken – keine Build-Artefakte.
 #   moodle-source  Holt den Moodle-Quellcode aus dem Git-Repository (ohne .git).
-#   moodle         base + Moodle-Quellcode.
+#   moodle-vendor  Installiert die Composer-Abhängigkeiten (vendor/) des Moodle-Codes.
+#   moodle         base + Moodle-Quellcode inkl. vendor/ (PHP-FPM auf Port 9000).
+#   nginx          nginx + derselbe Moodle-Code: liefert statische Dateien aus und
+#                  reicht PHP-Anfragen per FastCGI an den moodle-Container weiter.
 #
 # Beispiele:
 #   docker build --target base   -t moodle-base .
-#   docker build --target moodle -t moodle-dev  --build-arg MOODLE_REF=MOODLE_503_STABLE .
+#   docker build --target moodle -t moodle-dev       --build-arg MOODLE_REF=MOODLE_503_STABLE .
+#   docker build --target nginx  -t moodle-dev-nginx --build-arg MOODLE_REF=MOODLE_503_STABLE .
 #
 # ==============================================================================
 
@@ -22,7 +26,7 @@ ARG DEBIAN_RELEASE=bookworm
 # ------------------------------------------------------------------------------
 # Stage 1: builder
 # ------------------------------------------------------------------------------
-FROM php:${PHP_VERSION}-apache-${DEBIAN_RELEASE} AS builder
+FROM php:${PHP_VERSION}-fpm-${DEBIAN_RELEASE} AS builder
 
 COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
 
@@ -57,9 +61,9 @@ RUN set -eux; \
     cat /runtime-packages.txt
 
 # ------------------------------------------------------------------------------
-# Stage 2: base – PHP + Apache ohne Build-Artefakte
+# Stage 2: base – PHP-FPM ohne Build-Artefakte
 # ------------------------------------------------------------------------------
-FROM php:${PHP_VERSION}-apache-${DEBIAN_RELEASE} AS base
+FROM php:${PHP_VERSION}-fpm-${DEBIAN_RELEASE} AS base
 
 COPY --from=builder /runtime-packages.txt /tmp/runtime-packages.txt
 
@@ -73,12 +77,14 @@ RUN set -eux; \
 COPY --from=builder /usr/local/lib/php/extensions/ /usr/local/lib/php/extensions/
 COPY --from=builder /usr/local/etc/php/conf.d/     /usr/local/etc/php/conf.d/
 
-COPY ./Docker/php.ini /usr/local/etc/php/php.ini
+COPY ./Docker/php.ini      /usr/local/etc/php/php.ini
+# Lädt nach zz-docker.conf des Basis-Images und überschreibt dessen Werte
+COPY ./Docker/php-fpm.conf /usr/local/etc/php-fpm.d/zz-moodle.conf
 
 RUN set -eux; \
-    a2enmod headers rewrite actions; \
     mkdir -p /var/www/moodledata; \
     chown www-data:www-data /var/www/moodledata; \
+    php-fpm --test; \
     # Sicherstellen, dass alle Erweiterungen ohne fehlende Libraries laden
     php -m > /tmp/php-modules; \
     for ext in exif gd imagick intl ldap mysqli pdo_pgsql pgsql redis soap sodium xdebug xsl zip "Zend OPcache"; do \
@@ -103,24 +109,48 @@ RUN set -eux; \
     rm -rf /moodle/.git
 
 # ------------------------------------------------------------------------------
-# Stage 4: moodle – base + Moodle-Code
+# Stage 4: moodle-vendor – Composer-Abhängigkeiten installieren
+# ------------------------------------------------------------------------------
+# In neueren Moodle-Versionen (z.B. 5.3) sind einige Bibliotheken (z.B. league/oauth2-server,
+# symfony/console) nicht mehr im Code enthalten, sondern werden über Composer
+# nach vendor/ installiert. Läuft auf base, damit die Plattform-Prüfung von
+# Composer dieselben PHP-Erweiterungen sieht wie zur Laufzeit.
+FROM base AS moodle-vendor
+
+COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
+COPY --from=moodle-source /moodle /moodle
+
+RUN set -eux; \
+    if [ -f /moodle/composer.lock ]; then \
+      COMPOSER_ALLOW_SUPERUSER=1 composer install -d /moodle \
+        --no-dev --no-interaction --no-progress --no-cache --optimize-autoloader; \
+    fi
+
+# ------------------------------------------------------------------------------
+# Stage 5: moodle – PHP-FPM + Moodle-Code
 # ------------------------------------------------------------------------------
 FROM base AS moodle
 
-COPY --from=moodle-source --chown=www-data:www-data /moodle /var/www/html
+COPY --from=moodle-vendor --chown=www-data:www-data /moodle /var/www/html
 
 # config.php liest die Einstellungen aus Umgebungsvariablen (siehe docker-compose.yaml)
 COPY --chown=www-data:www-data ./Docker/config.php /var/www/html/config.php
 
+# ------------------------------------------------------------------------------
+# Stage 6: nginx – Webserver vor PHP-FPM
+# ------------------------------------------------------------------------------
+# nginx braucht den Code unter demselben Pfad wie PHP-FPM: für statische Dateien
+# und um zu prüfen, ob ein angefragtes *.php existiert oder an den Router geht.
+FROM nginx:stable AS nginx
+
+COPY --from=moodle-vendor /moodle /var/www/html
+COPY ./Docker/nginx.conf /etc/nginx/conf.d/default.conf
+
 # Ab Moodle 5.1 liegt der Webroot im Unterordner public/ und Moodle nutzt
-# einen Router (r.php). Apache wird passend zur ausgecheckten Version konfiguriert.
+# einen Router (r.php). nginx wird passend zur ausgecheckten Version konfiguriert:
+# Unbekannte Pfade – auch nicht existierende *.php (Shim-Routen) – gehen an r.php.
 RUN set -eux; \
     if [ -d /var/www/html/public ]; then docroot=/var/www/html/public; else docroot=/var/www/html; fi; \
-    sed -ri "s!/var/www/html!${docroot}!g" /etc/apache2/sites-available/*.conf; \
-    { \
-      echo "<Directory ${docroot}>"; \
-      echo "    AllowOverride All"; \
-      if [ -f "${docroot}/r.php" ]; then echo "    FallbackResource /r.php"; fi; \
-      echo "</Directory>"; \
-    } > /etc/apache2/conf-available/moodle.conf; \
-    a2enconf moodle
+    if [ -f "${docroot}/r.php" ]; then fallback=/r.php; else fallback==404; fi; \
+    sed -i -e "s!__DOCROOT__!${docroot}!g" -e "s!__FALLBACK__!${fallback}!g" /etc/nginx/conf.d/default.conf; \
+    nginx -t

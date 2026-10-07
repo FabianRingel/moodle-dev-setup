@@ -31,13 +31,19 @@ $CFG->admin    = 'admin';
 
 $CFG->directorypermissions = 02777;
 
-// Apache leitet unbekannte Pfade an r.php weiter (siehe Dockerfile).
+// nginx leitet unbekannte Pfade an r.php weiter (siehe Docker/nginx.conf).
 $CFG->routerconfigured = true;
 
 // Entwicklungseinstellungen
 if ($env('MOODLE_DEBUG', '1') === '1') {
     $CFG->debug = E_ALL;
     $CFG->debugdisplay = 1;
+}
+
+// Zusätzliche Einstellungen, z.B. für eigene Plugins: alle *.php aus einem eingehängten
+// Ordner einbinden (siehe docker-compose.yaml, config.d). Dort sind $CFG und $env verfügbar.
+foreach (glob('/var/www/config.d/*.php') ?: [] as $extraconfig) {
+    require $extraconfig;
 }
 
 require_once(__DIR__ . '/lib/setup.php');

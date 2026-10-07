@@ -6,7 +6,8 @@
 # mit allen erforderlichen Services für die lokale Entwicklung.
 #
 # Services:
-# - moodle: Haupt-Webserver mit PHP 8.3, Apache und Moodle aus dem Git-Repository
+# - nginx: Webserver, liefert statische Dateien aus und reicht PHP an moodle weiter
+# - moodle: PHP 8.3 (PHP-FPM) mit Moodle aus dem Git-Repository
 # - moodle-cron: Cron-Service für automatische Moodle-Tasks (gleiches Image)
 # - postgres: PostgreSQL 17 Datenbank
 # - pgadmin: Web-Interface für Datenbankmanagement
@@ -16,9 +17,9 @@
 #
 # ==============================================================================
 
-# Gemeinsame Einstellungen für Web- und Cron-Container
+# Gemeinsame Einstellungen für PHP-FPM- und Cron-Container
 x-moodle: &moodle
-  # Multi-Stage-Build: base (PHP ohne Build-Artefakte) -> moodle (Code aus Git)
+  # Multi-Stage-Build: base (PHP-FPM ohne Build-Artefakte) -> moodle (Code aus Git)
   build:
     context: .
     target: moodle
@@ -43,8 +44,14 @@ x-moodle: &moodle
     # Moodle-Datenverzeichnis (Uploads, Cache, etc.)
     - ./moodledata:/var/www/moodledata
     # Der Moodle-Code liegt im Image. Für die Plugin-Entwicklung einzelne
-    # Plugin-Verzeichnisse einhängen, z.B. (ab Moodle 5.1 unter public/):
+    # Plugin-Verzeichnisse einhängen, z.B. (ab Moodle 5.1 unter public/).
+    # Dasselbe Volume auch beim nginx-Service eintragen (statische Dateien):
     # - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
+    # Zusätzliche config.php-Einstellungen: *.php in diesem Ordner werden eingebunden
+    # - ./config.d:/var/www/config.d:ro
+    #
+    # Eigene Erweiterungen (Plugins, Dienste) besser in einer zusätzlichen Compose-Datei
+    # pflegen und per COMPOSE_FILE in .env aktivieren (siehe README, "Erweiterungen").
 
   depends_on:
     postgres:
@@ -53,23 +60,51 @@ x-moodle: &moodle
 services:
 
   # =============================================================================
-  # MOODLE WEB-SERVICE
+  # MOODLE PHP-FPM-SERVICE
   # =============================================================================
+  # Hält den gemeinsamen Netzwerk-Namespace für nginx und Cron (wie ein Pod):
+  # Moodle ruft seine wwwroot (http://localhost) auch serverseitig auf, z.B. für
+  # die Router-Prüfung – dort muss localhost:80 dann nginx sein.
   moodle:
     <<: *moodle
 
-    # Port-Mapping: Host:Container
+    # Port-Mapping: Host:Container (Port 80 gehört nginx im selben Namespace)
     # Moodle ist über http://<ip> erreichbar
     ports:
       - 80:80
 
   # =============================================================================
+  # NGINX WEBSERVER
+  # =============================================================================
+  # Liefert statische Dateien aus dem (gleichen) Moodle-Code aus und reicht
+  # PHP-Anfragen per FastCGI an 127.0.0.1:9000 weiter (siehe Docker/nginx.conf).
+  nginx:
+    build:
+      context: .
+      target: nginx
+      args:
+        MOODLE_REF: ${MOODLE_REF:-MOODLE_503_STABLE}
+    image: moodle-dev-nginx:${MOODLE_REF:-MOODLE_503_STABLE}
+    restart: always
+    network_mode: service:moodle
+
+    # volumes:
+    #   - ./plugins/local_myplugin:/var/www/html/public/local/myplugin
+
+    depends_on:
+      - moodle
+
+  # =============================================================================
   # MOODLE CRON-SERVICE
   # =============================================================================
-  # Nutzt dasselbe Image wie der Web-Container und führt den Moodle-Cron
+  # Nutzt dasselbe Image wie der PHP-FPM-Container und führt den Moodle-Cron
   # jede Minute als www-data aus (keine root-eigenen Dateien in moodledata).
+  # Teilt den Netzwerk-Namespace, damit Tasks die wwwroot erreichen.
   moodle-cron:
     <<: *moodle
+    network_mode: service:moodle
+    depends_on:
+      - moodle
     user: www-data
     command: ["sh", "-c", "while true; do php /var/www/html/admin/cli/cron.php; sleep 60; done"]
 

@@ -1,0 +1,14 @@
+# Geheimnisse
+.env
+
+# Laufzeitdaten der Compose-Services
+moodledata/
+pgdata/
+pgadmin/
+
+# Eigene Plugins und Erweiterungen liegen in eigenen Repositories
+# (nach plugins/ bzw. in einen eigenen Ordner klonen, siehe README "Erweiterungen")
+plugins/
+tools/
+extensions/
+config.d/
